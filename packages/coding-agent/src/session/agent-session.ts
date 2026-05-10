@@ -150,6 +150,7 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { buildNamedToolChoice } from "../utils/tool-choice";
+import { AuthRefreshRunner, isAuthErrorMessage, selectAuthRefreshCommand } from "./auth-refresh";
 import type { AuthStorage } from "./auth-storage";
 import {
 	type CompactionPreparation,
@@ -545,6 +546,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
+	#authRefreshRunner = new AuthRefreshRunner();
 	// Todo completion reminder state
 	#todoReminderCount = 0;
 	#todoPhases: TodoPhase[] = [];
@@ -5870,9 +5872,13 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Check if an error is retryable (transient errors or usage limits).
+	 * Check if an error is retryable (transient errors, usage limits, or auth
+	 * errors when `retry.authRefresh` is configured for the active provider).
+	 *
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 * Usage-limit errors are retryable because the retry handler performs credential switching.
+	 * Auth errors are retryable only when the user has wired up a refresh
+	 * command — otherwise the original 401/403 surfaces as before.
 	 */
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
@@ -5882,7 +5888,14 @@ export class AgentSession {
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		const err = message.errorMessage;
-		return this.#isTransientErrorMessage(err) || isUsageLimitError(err);
+		if (this.#isTransientErrorMessage(err) || isUsageLimitError(err)) return true;
+		if (isAuthErrorMessage(err) && this.#getAuthRefreshCommand() !== undefined) return true;
+		return false;
+	}
+
+	#getAuthRefreshCommand(): string | undefined {
+		const retrySettings = this.settings.getGroup("retry");
+		return selectAuthRefreshCommand(retrySettings.authRefresh, this.model?.provider);
 	}
 
 	#isTransientErrorMessage(errorMessage: string): boolean {
@@ -6197,6 +6210,65 @@ export class AgentSession {
 		}
 
 		const errorMessage = message.errorMessage || "Unknown error";
+
+		// Auth-refresh path: when this is an auth-class failure AND the user
+		// has wired up `retry.authRefresh` for this provider (or `default`),
+		// shell out to the refresh command before retrying. On success: replay
+		// the request immediately. On failure: surface the original auth error
+		// so the user understands what happened — do NOT silently fall through
+		// to backoff, because successive retries against an unrefreshed
+		// credential would just burn the budget and pointless re-attempts.
+		if (isAuthErrorMessage(errorMessage)) {
+			const refreshCommand = selectAuthRefreshCommand(retrySettings.authRefresh, this.model?.provider);
+			if (refreshCommand) {
+				const refreshController = new AbortController();
+				this.#retryAbortController?.abort();
+				this.#retryAbortController = refreshController;
+
+				const refreshOk = await this.#runAuthRefresh(
+					refreshCommand,
+					retrySettings.authRefreshTimeoutMs,
+					errorMessage,
+					refreshController.signal,
+				);
+
+				if (this.#retryAbortController === refreshController) {
+					this.#retryAbortController = undefined;
+				}
+
+				if (!refreshOk) {
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt: this.#retryAttempt - 1,
+						finalError: errorMessage,
+					});
+					this.#retryAttempt = 0;
+					this.#resolveRetry();
+					return false;
+				}
+
+				// Refresh succeeded — replay immediately, skipping the usage-limit
+				// and model-fallback paths (they don't apply to auth errors).
+				await this.#emitSessionEvent({
+					type: "auto_retry_start",
+					attempt: this.#retryAttempt,
+					maxAttempts: retrySettings.maxRetries,
+					delayMs: 0,
+					errorMessage,
+				});
+				const messagesAfterRefresh = this.agent.state.messages;
+				if (
+					messagesAfterRefresh.length > 0 &&
+					messagesAfterRefresh[messagesAfterRefresh.length - 1].role === "assistant"
+				) {
+					this.agent.replaceMessages(messagesAfterRefresh.slice(0, -1));
+				}
+				this.#scheduleAgentContinue({ delayMs: 1, generation });
+				return true;
+			}
+		}
+
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = retrySettings.baseDelayMs * 2 ** (this.#retryAttempt - 1);
 		let switchedCredential = false;
@@ -6276,6 +6348,52 @@ export class AgentSession {
 		// Retry via continue() outside the agent_end event callback chain.
 		this.#scheduleAgentContinue({ delayMs: 1, generation });
 
+		return true;
+	}
+
+	/**
+	 * Run the configured `retry.authRefresh` shell command and stream its
+	 * output to the user via `emitNotice`. Returns `true` when the command
+	 * exited successfully so the caller may retry the request.
+	 *
+	 * Single-flight is provided by `AuthRefreshRunner` keyed on the command
+	 * line — concurrent requests against the same expired credential trigger
+	 * exactly one shell-out.
+	 */
+	async #runAuthRefresh(
+		command: string,
+		timeoutMs: number,
+		originalError: string,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const provider = this.model?.provider ?? "default";
+		this.emitNotice("info", "Authentication error detected; running auth refresh.", "auth-refresh");
+
+		const outcome = await this.#authRefreshRunner.refresh({
+			provider,
+			command,
+			timeoutMs,
+			signal,
+			onOutput: (line, stream) => {
+				if (!line.trim()) return;
+				const level = stream === "stderr" ? "warning" : "info";
+				this.emitNotice(level, line, `auth-refresh:${stream}`);
+			},
+		});
+
+		if (!outcome.ok) {
+			this.emitNotice("error", `Auth refresh failed: ${outcome.reason}.`, "auth-refresh");
+			logger.warn("Auth refresh failed", {
+				provider,
+				command,
+				reason: outcome.reason,
+				originalError,
+				durationMs: outcome.durationMs,
+			});
+			return false;
+		}
+
+		this.emitNotice("info", `Auth refresh succeeded in ${outcome.durationMs}ms; retrying request.`, "auth-refresh");
 		return true;
 	}
 

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `retry.authRefresh` and `retry.authRefreshTimeoutMs` settings so auto-retry can shell out to a user-configured refresh command (`aws sso login`, `claude-code-token-refresh`, etc.) when the active provider returns an auth-class failure. The active model's provider id is looked up first, then the special key `default` as a global fallback; an empty record (the default) keeps existing behaviour — auth errors stay non-retryable. Output streams to the user via `emitNotice`, single-flight by command line so a burst of concurrent failures triggers exactly one shell-out, and a hard timeout (default 120s) kills runaway SSO browser flows. On refresh failure the original auth error is surfaced unchanged. Mirrors Claude Code's `awsAuthRefresh` semantics generalised to any provider.
 - Added dedicated HTML rendering for `eval` tool calls, including cell-by-cell parsing of `===== ... =====` blocks with inferred Python/JS/TypeScript highlighting
 - Added dedicated rendering support for `search`, `recipe`, and `irc` tool calls in transcript exports
 - Added a collapsible `Available Tools` section with a tool count and chip-style compact tool names

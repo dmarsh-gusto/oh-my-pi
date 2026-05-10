@@ -11,6 +11,7 @@ import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
+import { isOAuthDefinitiveFailure } from "./auth-error-classification";
 import { getEnvApiKey } from "./stream";
 import type { Provider } from "./types";
 import type {
@@ -1979,11 +1980,9 @@ export class AuthStorage {
 			return result.apiKey;
 		} catch (error) {
 			const errorMsg = String(error);
-			// Only remove credentials for definitive auth failures
-			// Keep credentials for transient errors (network, 5xx) and block temporarily
-			const isDefinitiveFailure =
-				/invalid_grant|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(errorMsg) ||
-				(/\b(401|403)\b/.test(errorMsg) && !/timeout|network|fetch failed|ECONNREFUSED/i.test(errorMsg));
+			// Only remove credentials for definitive auth failures; keep them for
+			// transient errors (network, 5xx) and block temporarily instead.
+			const isDefinitiveFailure = isOAuthDefinitiveFailure(errorMsg);
 
 			logger.warn("OAuth token refresh failed", {
 				provider,

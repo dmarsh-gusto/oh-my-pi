@@ -747,6 +747,8 @@ export const SETTINGS_SCHEMA = {
 
 	"retry.baseDelayMs": { type: "number", default: 2000 },
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
+	"retry.authRefresh": { type: "record", default: {} as Record<string, string> },
+	"retry.authRefreshTimeoutMs": { type: "number", default: 120_000 },
 	"retry.fallbackRevertPolicy": {
 		type: "enum",
 		values: ["cooldown-expiry", "never"] as const,
@@ -2607,6 +2609,15 @@ export interface RetrySettings {
 	enabled: boolean;
 	maxRetries: number;
 	baseDelayMs: number;
+	/**
+	 * Provider-keyed shell commands. When auto-retry encounters an auth
+	 * failure, the orchestrator looks up the active model's provider id, then
+	 * falls back to the special key `default`. An empty record (the default)
+	 * keeps the historical behavior: auth errors stay non-retryable.
+	 */
+	authRefresh: Record<string, string>;
+	/** Hard upper bound on a single auth-refresh shell-out, in milliseconds. */
+	authRefreshTimeoutMs: number;
 }
 
 export interface MemoriesSettings {
